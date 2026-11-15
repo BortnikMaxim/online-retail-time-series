@@ -7,7 +7,9 @@ from urllib.request import urlopen
 from warnings import catch_warnings, simplefilter
 from zipfile import ZipFile
 
+import numpy as np
 import pandas as pd
+from scipy.stats import friedmanchisquare, median_abs_deviation
 from statsmodels.tools.sm_exceptions import InterpolationWarning
 from statsmodels.tsa.seasonal import STL
 from statsmodels.tsa.stattools import acf, adfuller, kpss
@@ -16,6 +18,7 @@ from statsmodels.tsa.stattools import acf, adfuller, kpss
 DATA_URL = "https://archive.ics.uci.edu/static/public/352/online+retail.zip"
 DATA_SHA256 = "43465a06f2ccf7c8b5bd2892bc7defb52f97487934fe93b16ae4c3936424676d"
 REQUIRED_FIELDS = ["StockCode", "InvoiceDate", "InvoiceNo", "Quantity", "UnitPrice"]
+WEEKDAYS = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
 
 
 def load_transactions(path="data/Online Retail.xlsx"):
@@ -143,19 +146,40 @@ def upper_iqr_flags(y, multiplier=1.5):
     return y.gt(threshold), float(threshold)
 
 
-def peak_invoice_summary(product, dates):
-    """Показать, насколько объём в день пика сосредоточен в одном счёте."""
-    invoices = (
-        product.assign(date=product["InvoiceDate"].dt.normalize())
-        .loc[lambda frame: frame["date"].isin(dates)]
-        .groupby(["date", "InvoiceNo"])["Quantity"]
-        .sum()
-    )
-    summary = invoices.groupby(level="date").agg(
-        total="sum", invoices="size", largest_invoice="max"
+def peak_invoice_summary(product, dates, freq="D"):
+    """Оценить долю крупнейшего счёта в выбранных днях или неделях."""
+    invoices = product.groupby(
+        [pd.Grouper(key="InvoiceDate", freq=freq), "InvoiceNo"],
+        observed=True,
+    )["Quantity"].sum()
+    summary = (
+        invoices.groupby(level="InvoiceDate")
+        .agg(total="sum", invoices="size", largest_invoice="max")
+        .rename_axis("date")
+        .reindex(dates)
     )
     summary["largest_share"] = summary["largest_invoice"] / summary["total"]
     return summary
+
+
+def trailing_anomalies(y, window=10, min_history=8, cutoff=3.5):
+    """Сравнить объём с медианой и MAD предыдущих недель на шкале log1p."""
+    logged = np.log1p(y)
+    history = logged.shift().rolling(window, min_periods=min_history)
+    center = history.median()
+    mad = history.apply(
+        lambda values: median_abs_deviation(values, nan_policy="omit"), raw=True
+    )
+    scale = 1.4826 * mad.where(mad.gt(0))
+    score = (logged - center) / scale
+    return pd.DataFrame(
+        {
+            "baseline": np.expm1(center),
+            "upper_limit": np.expm1(center + cutoff * scale),
+            "score": score,
+            "flag": score.gt(cutoff),
+        }
+    )
 
 
 def weekday_profile(daily):
@@ -169,8 +193,59 @@ def weekday_profile(daily):
     )
     profile["active_mean"] = active.groupby(active.index.dayofweek).mean()
     profile["active_median"] = active.groupby(active.index.dayofweek).median()
-    profile.index = pd.Index(["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"], name="день")
+    profile.index = pd.Index(WEEKDAYS, name="день")
     return profile
+
+
+def weekday_sales_matrix(daily):
+    """Построить матрицу неделя × день. Серии без покрытия получают NaN."""
+    day = daily.index.dayofweek
+    sunday = daily.index + pd.to_timedelta(6 - day, unit="D")
+    return (
+        daily["units"]
+        .where(daily["shop_active"])
+        .to_frame()
+        .assign(week=sunday, weekday=day)
+        .pivot(index="week", columns="weekday", values="units")
+        .reindex(columns=range(7))
+        .set_axis(WEEKDAYS, axis="columns")
+    )
+
+
+def weekday_permutation_test(samples, block_weeks=1, resamples=19_999, seed=21790):
+    """Тест Фридмана с перестановками названий дней внутри блоков недель."""
+    values = samples.to_numpy()
+    n, k = values.shape
+    if n < 2 or k < 3 or samples.isna().any().any():
+        raise ValueError("Нужны сопоставимые недели без пропусков и минимум три дня.")
+    if block_weeks < 1 or resamples < 1 or not samples.index.is_monotonic_increasing:
+        raise ValueError("Нужны положительные размеры и хронологический порядок.")
+
+    # Поправка Фридмана на одинаковые ранги постоянна при перестановках.
+    ranks = samples.rank(axis=1).sub((k + 1) / 2)
+    statistic = (
+        friedmanchisquare(*values.T).statistic if ranks.ne(0).any().any() else 0.0
+    )
+    week_number = (samples.index - samples.index[0]).days // 7
+    blocks = ranks.groupby(week_number // block_weeks).sum().to_numpy()
+    if len(blocks) < 2:
+        raise ValueError("Тесту нужны хотя бы два блока.")
+
+    rng = np.random.default_rng(seed)
+    permutations = rng.random((resamples, len(blocks), k)).argsort(axis=-1)
+    simulated = np.take_along_axis(blocks[None, :, :], permutations, axis=-1)
+    perm_scores = np.square(simulated.sum(axis=1)).sum(axis=1)
+    observed_score = np.square(blocks.sum(axis=0)).sum()
+    p_value = (np.count_nonzero(perm_scores >= observed_score) + 1) / (resamples + 1)
+    return pd.Series(
+        {
+            "недель": n,
+            "блоков": len(blocks),
+            "χ² Фридмана": statistic,
+            "W Кендалла": statistic / (n * (k - 1)),
+            "p перестановок": p_value,
+        }
+    )
 
 
 def decompose(y, period=7):
@@ -189,7 +264,7 @@ def autocorrelations(y, nlags=28):
     return pd.Series(acf(y, nlags=nlags), name="ACF").rename_axis("лаг")
 
 
-def stationarity_tests(y, regression="c"):
+def stationarity_tests(y, regression="c", kpss_lags="auto"):
     """ADF и KPSS с константой или константой и линейным трендом."""
     if y.isna().any() or y.nunique() < 2:
         raise ValueError("Тестам нужен ряд без пропусков с меняющимися значениями.")
@@ -198,15 +273,18 @@ def stationarity_tests(y, regression="c"):
     )
     with catch_warnings(record=True) as caught:
         simplefilter("always", InterpolationWarning)
-        kpss_stat, kpss_p, kpss_lags, _ = kpss(y, regression=regression, nlags="auto")
+        kpss_stat, kpss_p, used_kpss_lags, _ = kpss(
+            y, regression=regression, nlags=kpss_lags
+        )
     p_bound = "="
     if any(issubclass(w.category, InterpolationWarning) for w in caught):
         p_bound = ">" if kpss_p == 0.10 else "<"
+    shown_kpss_p = f"{kpss_p:.4g}" if p_bound == "=" else f"{p_bound} {kpss_p:.2f}"
     return pd.DataFrame(
         {
             "статистика": [adf_stat, kpss_stat],
-            "p": [f"{adf_p:.4g}", f"{p_bound} {kpss_p:.2f}"],
-            "лаги": [adf_lags, kpss_lags],
+            "p": [f"{adf_p:.4g}", shown_kpss_p],
+            "лаги": [adf_lags, used_kpss_lags],
             "H₀ отклонена при 5%": [adf_p < 0.05, kpss_p < 0.05],
         },
         index=pd.Index(["ADF", "KPSS"], name="тест"),
